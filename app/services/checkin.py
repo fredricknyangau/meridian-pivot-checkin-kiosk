@@ -2,12 +2,14 @@ import asyncio
 import logging
 import uuid
 from typing import List, Optional, Callable
+from uuid import UUID
 import asyncpg
 from app.messaging.rabbitmq import publish_print_job_sync, RabbitMQPublishError
 from app.schemas.checkin import (
     AttendeeSchema,
     CheckinResponse,
     AttendeeDetailResponse,
+    PrintConfirmationResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -21,7 +23,6 @@ class CheckinPublishError(Exception):
 class CheckinService:
     def __init__(self, db_pool: asyncpg.Pool, publisher_func: Optional[Callable] = None):
         self.db_pool = db_pool
-        # Allows injecting a mock publisher in tests
         self.publisher_func = publisher_func or publish_print_job_sync
 
     async def get_all_attendees(self) -> List[AttendeeSchema]:
@@ -63,7 +64,6 @@ class CheckinService:
                 )
 
                 if updated_row:
-                    # Successfully claimed - create corresponding print_jobs record
                     await conn.execute(
                         """
                         INSERT INTO print_jobs (id, attendee_id, status)
@@ -73,7 +73,7 @@ class CheckinService:
                         attendee_id
                     )
 
-            # 2. Transaction committed cleanly - attempt RabbitMQ publication if claimed
+            # 2. Transaction committed cleanly - attempt RabbitMQ publication
             if updated_row:
                 try:
                     await asyncio.to_thread(
@@ -87,7 +87,6 @@ class CheckinService:
                         "RabbitMQ publishing failed for attendee %s (job %s): %s. Reverting DB state.",
                         attendee_id, new_print_job_id, exc
                     )
-                    # Compensation action: revert DB state to avoid inconsistent state
                     async with conn.transaction():
                         await conn.execute(
                             "DELETE FROM print_jobs WHERE id = $1;",
@@ -105,7 +104,7 @@ class CheckinService:
                     print_job_id=str(new_print_job_id)
                 )
 
-            # 3. Atomic update returned no row - handle non-claim scenarios (duplicate scans never publish)
+            # 3. Handle non-claim scenarios
             attendee = await conn.fetchrow(
                 "SELECT id, name, status FROM attendees WHERE id = $1;",
                 attendee_id
@@ -117,7 +116,6 @@ class CheckinService:
             current_status = attendee["status"]
 
             if current_status == "PENDING":
-                # Find existing PENDING print job
                 job_id = await conn.fetchval(
                     "SELECT id FROM print_jobs WHERE attendee_id = $1 AND status = 'PENDING' LIMIT 1;",
                     attendee_id
@@ -139,4 +137,78 @@ class CheckinService:
                     attendee_id=attendee_id,
                     status=current_status,
                     message=f"Attendee is in state {current_status}"
+                )
+
+    async def process_print_confirmation(self, print_job_id: UUID, result: str) -> Optional[PrintConfirmationResponse]:
+        """Process asynchronous print vendor webhook notification idempotently."""
+        async with self.db_pool.acquire() as conn:
+            # CASE 1: Query print job by print_job_id
+            print_job = await conn.fetchrow(
+                "SELECT id, attendee_id, status FROM print_jobs WHERE id = $1;",
+                print_job_id
+            )
+            if not print_job:
+                logger.warning("Print confirmation received for unknown print_job_id: %s", print_job_id)
+                return None
+
+            attendee_id = print_job["attendee_id"]
+            attendee = await conn.fetchrow(
+                "SELECT id, name, status FROM attendees WHERE id = $1;",
+                attendee_id
+            )
+
+            if not attendee:
+                logger.warning("Print job %s references non-existent attendee %s", print_job_id, attendee_id)
+                return None
+
+            current_status = attendee["status"]
+
+            # CASE 2: Known print job + attendee is PENDING
+            if current_status == "PENDING":
+                async with conn.transaction():
+                    await conn.execute(
+                        """
+                        UPDATE print_jobs
+                        SET status = 'COMPLETED',
+                            completed_at = NOW()
+                        WHERE id = $1;
+                        """,
+                        print_job_id
+                    )
+                    await conn.execute(
+                        """
+                        UPDATE attendees
+                        SET status = 'CHECKED_IN',
+                            updated_at = NOW()
+                        WHERE id = $1
+                          AND status = 'PENDING'
+                        RETURNING id, name, status;
+                        """,
+                        attendee_id
+                    )
+
+                logger.info("Attendee %s successfully transitioned PENDING -> CHECKED_IN via job %s", attendee_id, print_job_id)
+                return PrintConfirmationResponse(
+                    status="success",
+                    message="Attendee checked in successfully",
+                    attendee_id=attendee_id,
+                    print_job_id=str(print_job_id)
+                )
+
+            # CASE 3: Known print job + attendee already CHECKED_IN (idempotent duplicate webhook)
+            elif current_status == "CHECKED_IN":
+                logger.info("Duplicate print confirmation received for attendee %s (already CHECKED_IN), job %s", attendee_id, print_job_id)
+                return PrintConfirmationResponse(
+                    status="success",
+                    message="Webhook already processed",
+                    attendee_id=attendee_id,
+                    print_job_id=str(print_job_id)
+                )
+            else:
+                # Other status handling
+                return PrintConfirmationResponse(
+                    status="success",
+                    message=f"Attendee is in status {current_status}",
+                    attendee_id=attendee_id,
+                    print_job_id=str(print_job_id)
                 )

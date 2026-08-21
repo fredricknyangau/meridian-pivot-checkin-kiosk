@@ -39,3 +39,17 @@ class AttendeeDetailResponse(BaseModel):
     status: str
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class PrintConfirmationPayload(BaseModel):
+    print_job_id: UUID
+    result: str = "success"
+
+
+class PrintConfirmationResponse(BaseModel):
+    status: str
+    message: str
+    attendee_id: Optional[int] = None
+    print_job_id: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
