@@ -7,7 +7,7 @@ from app.schemas.checkin import (
     CheckinResponse,
     AttendeeDetailResponse,
 )
-from app.services.checkin import CheckinService
+from app.services.checkin import CheckinService, CheckinPublishError
 
 router = APIRouter(tags=["checkin"])
 
@@ -21,7 +21,14 @@ async def checkin_attendee(
     attendee_id: int,
     service: CheckinService = Depends(get_checkin_service),
 ):
-    result = await service.checkin_attendee(attendee_id)
+    try:
+        result = await service.checkin_attendee(attendee_id)
+    except CheckinPublishError:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to enqueue print job"
+        )
+
     if result is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

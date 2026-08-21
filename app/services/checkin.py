@@ -1,16 +1,28 @@
+import asyncio
+import logging
 import uuid
-from typing import List, Optional
+from typing import List, Optional, Callable
 import asyncpg
+from app.messaging.rabbitmq import publish_print_job_sync, RabbitMQPublishError
 from app.schemas.checkin import (
     AttendeeSchema,
     CheckinResponse,
     AttendeeDetailResponse,
 )
 
+logger = logging.getLogger(__name__)
+
+
+class CheckinPublishError(Exception):
+    """Raised when check-in database transition succeeded but RabbitMQ publication failed."""
+    pass
+
 
 class CheckinService:
-    def __init__(self, db_pool: asyncpg.Pool):
+    def __init__(self, db_pool: asyncpg.Pool, publisher_func: Optional[Callable] = None):
         self.db_pool = db_pool
+        # Allows injecting a mock publisher in tests
+        self.publisher_func = publisher_func or publish_print_job_sync
 
     async def get_all_attendees(self) -> List[AttendeeSchema]:
         async with self.db_pool.acquire() as conn:
@@ -61,15 +73,39 @@ class CheckinService:
                         attendee_id
                     )
 
-            # Transaction committed cleanly here!
+            # 2. Transaction committed cleanly - attempt RabbitMQ publication if claimed
             if updated_row:
+                try:
+                    await asyncio.to_thread(
+                        self.publisher_func,
+                        str(new_print_job_id),
+                        updated_row["id"],
+                        updated_row["name"]
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "RabbitMQ publishing failed for attendee %s (job %s): %s. Reverting DB state.",
+                        attendee_id, new_print_job_id, exc
+                    )
+                    # Compensation action: revert DB state to avoid inconsistent state
+                    async with conn.transaction():
+                        await conn.execute(
+                            "DELETE FROM print_jobs WHERE id = $1;",
+                            new_print_job_id
+                        )
+                        await conn.execute(
+                            "UPDATE attendees SET status = 'NOT_REQUESTED', updated_at = NOW() WHERE id = $1;",
+                            attendee_id
+                        )
+                    raise CheckinPublishError("Failed to publish print job to queue") from exc
+
                 return CheckinResponse(
                     attendee_id=updated_row["id"],
                     status="PENDING",
                     print_job_id=str(new_print_job_id)
                 )
 
-            # 2. Atomic update returned no row - handle non-claim scenarios
+            # 3. Atomic update returned no row - handle non-claim scenarios (duplicate scans never publish)
             attendee = await conn.fetchrow(
                 "SELECT id, name, status FROM attendees WHERE id = $1;",
                 attendee_id
